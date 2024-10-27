@@ -14,3 +14,7 @@ node_modules/
 
 # Игнорировать папку с виртуальным окружением
 venv/
+
+# Игнорировать файл .DS_Store (Desktop Services Store)
+.DS_Store
+

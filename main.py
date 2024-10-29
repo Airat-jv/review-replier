@@ -1,3 +1,11 @@
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/")
+async def read_root():
+    return {"Hello": "World"}
+
 import os
 import requests
 
@@ -17,39 +25,28 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Начальное значение для page_token
-page_token = None
+# Параметры запроса - лимит количества отзывов
+params = {
+    "limit": 1
+}
 
-# Получение отзывов с обработкой пагинации
-while True:
-    # Параметры запроса - лимит количества отзывов и page_token
-    params = {
-        "limit": 1
-    }
-    if page_token:
-        params["page_token"] = page_token
+# Тело запроса
+data = {
+    "reactionStatus": "NEED_REACTION",
+    "paid": False
+}
 
-    # Тело запроса
-    data = {
-        "reactionStatus": "NEED_REACTION",
-        "paid": False
-    }
+# Выполнение POST запроса для получения одного последнего отзыва
+response = requests.post(URL, headers=headers, params=params, json=data)
 
-    # Выполнение POST запроса
-    response = requests.post(URL, headers=headers, params=params, json=data)
-
-    # Обработка ответа
-    if response.status_code == 200:
-        result = response.json()
-        feedbacks = result.get("result", {}).get("feedbacks", [])
-        for feedback in feedbacks:
-            print(feedback)  # Выводим каждый отзыв
-
-        # Получаем токен следующей страницы
-        page_token = result.get("result", {}).get("paging", {}).get("nextPageToken")
-        if not page_token:
-            break  # Если токена следующей страницы нет, прекращаем цикл
-
+# Обработка ответа
+if response.status_code == 200:
+    result = response.json()
+    feedbacks = result.get("result", {}).get("feedbacks", [])
+    if feedbacks:
+        feedback = feedbacks[0]  # Получаем только один последний отзыв
+        print(feedback)  # Выводим последний отзыв
     else:
-        print(f"Ошибка при получении отзывов: {response.status_code}, {response.text}")
-        break
+        print("Нет отзывов, требующих ответа.")
+else:
+    print(f"Ошибка при получении отзывов: {response.status_code}, {response.text}")

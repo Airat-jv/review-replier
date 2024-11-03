@@ -2,4 +2,5 @@ fastapi
 uvicorn
 requests
 openai
-aiogram
+aiogram==2.25.1
+

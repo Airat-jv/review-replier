@@ -24,12 +24,32 @@ class Form(StatesGroup):
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    buttons = ["Выбрать маркетплейс"]
+    buttons = ["Выбрать маркетплейс", "Помощь"]
     keyboard.add(*buttons)
     await message.answer(
         "Здравствуйте! Этот бот поможет вам управлять отзывами на маркетплейсах.",
         reply_markup=keyboard
     )
+
+# Обработчик кнопки "Помощь" после /start
+@dp.message_handler(lambda message: message.text == "Помощь")
+async def process_help_button(message: types.Message):
+    await cmd_help(message)
+
+# Обработчик команды /help
+@dp.message_handler(commands=['help'])
+async def cmd_help(message: types.Message):
+    help_text = (
+        "ℹ️ *Популярные вопросы:*\n\n"
+        "🔹 *Как начать работу с ботом?*\n"
+        "— Нажмите кнопку 'Выбрать маркетплейс' и следуйте инструкциям.\n\n"
+        "🔹 *Как ввести API-ключ?*\n"
+        "— После выбора маркетплейса бот предложит ввести ваш API-ключ.\n\n"
+        "🔹 *Как получить свежий отзыв?*\n"
+        "— Нажмите кнопку 'Получить свежий отзыв' после ввода API-ключа.\n\n"
+        "Если у вас есть дополнительные вопросы, обратитесь к администратору."
+    )
+    await message.answer(help_text, parse_mode=types.ParseMode.MARKDOWN)
 
 # Обработчик нажатия кнопки "Выбрать маркетплейс"
 @dp.message_handler(lambda message: message.text == "Выбрать маркетплейс")
@@ -86,7 +106,6 @@ async def process_api_key(message: types.Message, state: FSMContext):
 async def get_fresh_review(message: types.Message, state: FSMContext):
     # Здесь нужно получить API-ключ из состояния или базы данных
     # Для простоты используем MemoryStorage, в реальном приложении используйте базу данных
-    # Получаем данные пользователя
     user_data = await state.get_data()
     api_key = user_data.get('api_key')
     if not api_key:

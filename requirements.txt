@@ -3,4 +3,7 @@ uvicorn
 requests
 openai
 aiogram==2.25.1
+SQLAlchemy
+psycopg2-binary
+
 

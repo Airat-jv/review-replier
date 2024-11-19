@@ -2,13 +2,28 @@ version: '3.8'
 
 services:
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
     image: review-replier-bot:latest
     env_file:
-      - .env
+      - .env.bot
+    depends_on:
+      - backend
+    restart: always
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: review-replier-backend:latest
+    env_file:
+      - .env.backend
     depends_on:
       - db
     restart: always
+    ports:
+      - "8000:8000"
 
   db:
     image: postgres:13
@@ -18,8 +33,6 @@ services:
       POSTGRES_DB: your_db_name
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     restart: always
 
 volumes:

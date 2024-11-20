@@ -47,12 +47,21 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(BigInteger, unique=True, index=True)
-    name = Column(String)  # Добавили поле для имени сотрудника
+    name = Column(String)
     auth_token = Column(String, unique=True, index=True)
-    api_keys = Column(String)
-    marketplaces = Column(String)
     company_id = Column(Integer, ForeignKey('companies.id'))
     company = relationship("Company", back_populates="users")
+    marketplace_accounts = relationship("MarketplaceAccount", back_populates="user")
+
+class MarketplaceAccount(Base):
+    __tablename__ = 'marketplace_accounts'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    marketplace = Column(String)
+    account_name = Column(String)
+    api_key = Column(String)
+    user = relationship("User", back_populates="marketplace_accounts")
 
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
@@ -146,23 +155,21 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
         else:
             return HTMLResponse(content="<h2>Код компании обязателен для заполнения.</h2>")
     else:
-        # При добавлении маркетплейсов используем существующую информацию
         company = user.company
 
     # Обработка маркетплейсов и API-ключей
-    api_keys = json.loads(user.api_keys) if user.api_keys else {}
-    marketplaces = json.loads(user.marketplaces) if user.marketplaces else []
-
     supported_marketplaces = ["Яндекс.Маркет", "OZON", "Wildberries"]
     for marketplace in supported_marketplaces:
         api_key = form_data.get(f"{marketplace}_api_key")
         if api_key:
-            api_keys[marketplace] = api_key
-            if marketplace not in marketplaces:
-                marketplaces.append(marketplace)
-
-    user.api_keys = json.dumps(api_keys)
-    user.marketplaces = json.dumps(marketplaces)
+            account_name = form_data.get(f"{marketplace}_account_name", f"Кабинет {marketplace}")
+            new_account = MarketplaceAccount(
+                user_id=user.id,
+                marketplace=marketplace,
+                account_name=account_name,
+                api_key=api_key
+            )
+            db.add(new_account)
 
     db.commit()
 
@@ -172,6 +179,74 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
 
     return HTMLResponse(content=f"""
     <h2>Данные успешно сохранены.</h2>
+    <p>Вы можете вернуться в бот, чтобы продолжить работу.</p>
+    <a href="tg://resolve?domain={bot_username}">Перейти в бот</a>
+    """)
+
+# эндпоинт для добавления кабинетов
+@app.get('/add_marketplace', response_class=HTMLResponse)
+async def add_marketplace_form(token: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.auth_token == token).first()
+    if not user:
+        raise HTTPException(status_code=404, detail='Invalid token')
+
+    supported_marketplaces = ["Яндекс.Маркет", "OZON", "Wildberries"]
+
+    marketplaces_options = ''.join([f'<option value="{mp}">{mp}</option>' for mp in supported_marketplaces])
+
+    html_content = f"""
+    <html>
+        <head>
+            <title>Добавить кабинет маркетплейса</title>
+        </head>
+        <body>
+            <h1>Добавьте новый кабинет маркетплейса</h1>
+            <form action="/add_marketplace" method="post">
+                <input type="hidden" name="token" value="{token}">
+                <label for="marketplace">Маркетплейс:</label>
+                <select id="marketplace" name="marketplace">
+                    {marketplaces_options}
+                </select><br><br>
+                <label for="account_name">Название кабинета:</label>
+                <input type="text" id="account_name" name="account_name" required><br><br>
+                <label for="api_key">API-ключ:</label>
+                <input type="text" id="api_key" name="api_key" required><br><br>
+                <button type="submit">Сохранить</button>
+            </form>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+# Обработчик формы (POST)
+@app.post('/add_marketplace', response_class=HTMLResponse)
+async def add_marketplace_submit(request: Request, db: Session = Depends(get_db)):
+    form_data = await request.form()
+    token = form_data.get('token')
+    user = db.query(User).filter(User.auth_token == token).first()
+    if not user:
+        raise HTTPException(status_code=404, detail='Invalid token')
+
+    marketplace = form_data.get('marketplace')
+    account_name = form_data.get('account_name')
+    if not account_name:
+        return HTMLResponse(content="<h2>Название кабинета обязательно для заполнения.</h2>")
+    api_key = form_data.get('api_key')
+
+    new_account = MarketplaceAccount(
+        user_id=user.id,
+        marketplace=marketplace,
+        account_name=account_name,
+        api_key=api_key
+    )
+    db.add(new_account)
+    db.commit()
+
+    # Возвращаем сообщение об успешном сохранении
+    bot_username = os.getenv('BOT_USERNAME', 'your_bot_username')
+
+    return HTMLResponse(content=f"""
+    <h2>Кабинет успешно добавлен.</h2>
     <p>Вы можете вернуться в бот, чтобы продолжить работу.</p>
     <a href="tg://resolve?domain={bot_username}">Перейти в бот</a>
     """)
@@ -199,9 +274,16 @@ async def generate_token(request: TokenRequest, db: Session = Depends(get_db)):
 @app.get('/is_authorized')
 async def is_authorized(telegram_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
-    if user and user.api_keys:
-        api_keys = json.loads(user.api_keys)
-        if api_keys:
+    if user:
+        # Проверяем, что у пользователя есть имя и компания
+        if not user.name or not user.company_id:
+            return {'authorized': False}
+        # Проверяем, есть ли у пользователя хотя бы один кабинет маркетплейса
+        accounts = db.query(MarketplaceAccount).filter(MarketplaceAccount.user_id == user.id).all()
+        if accounts:
+            return {'authorized': True}
+        else:
+            # Если нет кабинетов, но есть имя и компания, считаем пользователя авторизованным
             return {'authorized': True}
     return {'authorized': False}
 
@@ -217,29 +299,38 @@ async def user_info(telegram_id: int, db: Session = Depends(get_db)):
     else:
         raise HTTPException(status_code=404, detail='User not found')
 
-# Эндпоинт для получения списка маркетплейсов пользователя
-@app.get('/get_user_marketplaces')
-async def get_user_marketplaces(telegram_id: int, db: Session = Depends(get_db)):
+# # Эндпоинт для получения списка маркетплейсов пользователя
+# Эндпоинт для получения кабинетов пользователя
+@app.get('/get_user_marketplace_accounts')
+async def get_user_marketplace_accounts(telegram_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
-    if user and user.marketplaces:
-        marketplaces = json.loads(user.marketplaces)
-        return {'marketplaces': marketplaces}
+    if user:
+        accounts = db.query(MarketplaceAccount).filter(MarketplaceAccount.user_id == user.id).all()
+        return {'accounts': [
+            {
+                'id': account.id,
+                'marketplace': account.marketplace,
+                'account_name': account.account_name
+            } for account in accounts
+        ]}
     else:
-        return {'marketplaces': []}
+        return {'accounts': []}
 
 # Эндпоинт для получения свежего отзыва
 @app.get('/get_review')
-async def get_review(telegram_id: int, marketplace: str, db: Session = Depends(get_db)):
+async def get_review(telegram_id: int, account_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
-    if not user or not user.api_keys:
-        raise HTTPException(status_code=400, detail='User not authorized or no API keys found')
+    if not user:
+        raise HTTPException(status_code=400, detail='User not authorized')
 
-    api_keys = json.loads(user.api_keys)
-    api_key = api_keys.get(marketplace)
-    if not api_key:
-        raise HTTPException(status_code=400, detail='No API key for the selected marketplace')
+    account = db.query(MarketplaceAccount).filter(
+        MarketplaceAccount.id == account_id,
+        MarketplaceAccount.user_id == user.id
+    ).first()
+    if not account:
+        raise HTTPException(status_code=400, detail='Marketplace account not found')
 
-    # Здесь реализуйте логику получения отзыва с выбранного маркетплейса, используя соответствующий API-ключ
-    review = f"Пример отзыва с {marketplace}"
+    # Здесь реализуйте логику получения отзыва, используя account.api_key
+    review = f"Пример отзыва с {account.marketplace} - {account.account_name}"
 
     return {'review': review}

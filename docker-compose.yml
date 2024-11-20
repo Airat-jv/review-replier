@@ -17,6 +17,8 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     image: review-replier-backend:latest
+    volumes:
+      - .:/app
     env_file:
       - .env.backend
     depends_on:

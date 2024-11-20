@@ -63,34 +63,84 @@ async def generate_token(telegram_id):
             else:
                 return ''
 
-# Функция для получения списка маркетплейсов пользователя
-async def get_user_marketplaces(telegram_id):
+# Функция для получения списка маркетплейсов и кабинетов пользователя
+async def get_user_marketplace_accounts(telegram_id):
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"{BACKEND_URL}/get_user_marketplaces", params={
+        async with session.get(f"{BACKEND_URL}/get_user_marketplace_accounts", params={
             'telegram_id': telegram_id
         }) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data.get('marketplaces', [])
+                return data.get('accounts', [])
             else:
                 return []
 
 # Функция для отправки выбора маркетплейса
 async def send_marketplace_selection(chat_id):
-    marketplaces = await get_user_marketplaces(chat_id)
-    if not marketplaces:
-        await bot.send_message(chat_id, "У вас нет доступных маркетплейсов. Пожалуйста, добавьте маркетплейсы через команду /start.")
+    accounts = await get_user_marketplace_accounts(chat_id)
+    if not accounts:
+        await bot.send_message(chat_id, "У вас нет доступных кабинетов. Пожалуйста, добавьте кабинеты через команду /start.")
         return
+
+    # Группируем кабинеты по маркетплейсам
+    marketplaces = {}
+    for account in accounts:
+        mp = account['marketplace']
+        if mp not in marketplaces:
+            marketplaces[mp] = []
+        marketplaces[mp].append(account)
+
     keyboard = InlineKeyboardMarkup(row_width=1)
-    for marketplace in marketplaces:
-        button = InlineKeyboardButton(text=marketplace, callback_data=f"select_marketplace:{marketplace}")
-        keyboard.add(button)
-    # Удаляем предыдущее сообщение
+    for mp, accs in marketplaces.items():
+        if len(accs) == 1:
+            # Если один кабинет, добавляем кнопку сразу для него
+            callback_data = f"select_account:{accs[0]['id']}"
+            button = InlineKeyboardButton(text=f"{mp} - {accs[0]['account_name']}", callback_data=callback_data)
+            keyboard.add(button)
+        else:
+            # Если несколько кабинетов, добавляем кнопку для выбора кабинета
+            callback_data = f"choose_account:{mp}"
+            button = InlineKeyboardButton(text=f"{mp}", callback_data=callback_data)
+            keyboard.add(button)
     await delete_previous_bot_message(chat_id)
-    # Отправляем новое сообщение
-    sent_message = await bot.send_message(chat_id, "Пожалуйста, выберите маркетплейс:", reply_markup=keyboard)
-    # Сохраняем message_id
+    sent_message = await bot.send_message(chat_id, "Пожалуйста, выберите маркетплейс или кабинет:", reply_markup=keyboard)
     await storage.update_data(user=chat_id, data={'last_bot_message_id': sent_message.message_id})
+
+# Функция для Обработать выбор кабинета
+@dp.callback_query_handler(lambda c: c.data.startswith('choose_account:'))
+async def process_choose_account(callback_query: types.CallbackQuery):
+    marketplace = callback_query.data.split(':')[1]
+    accounts = await get_user_marketplace_accounts(callback_query.from_user.id)
+    accounts = [acc for acc in accounts if acc['marketplace'] == marketplace]
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for acc in accounts:
+        callback_data = f"select_account:{acc['id']}"
+        button = InlineKeyboardButton(text=acc['account_name'], callback_data=callback_data)
+        keyboard.add(button)
+    await delete_previous_bot_message(callback_query.from_user.id)
+    sent_message = await bot.send_message(callback_query.from_user.id, "Выберите кабинет:", reply_markup=keyboard)
+    await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+    await callback_query.answer()
+
+# Функция для Обработать выбор аккаунта
+@dp.callback_query_handler(lambda c: c.data.startswith('select_account:'))
+async def process_select_account(callback_query: types.CallbackQuery):
+    account_id = int(callback_query.data.split(':')[1])
+    # Сохраняем выбранный аккаунт
+    await storage.update_data(user=callback_query.from_user.id, data={'selected_account_id': account_id})
+    # Получаем информацию об аккаунте (например, для получения иконки)
+    # ...
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    button_text = "Получить свежий отзыв"
+    keyboard.add(button_text)
+    await delete_previous_bot_message(callback_query.from_user.id)
+    sent_message = await bot.send_message(
+        chat_id=callback_query.from_user.id,
+        text="Вы выбрали кабинет.",
+        reply_markup=keyboard
+    )
+    await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+    await callback_query.answer()
 
 # Функция для удаления предыдущего сообщения бота
 async def delete_previous_bot_message(chat_id):
@@ -131,7 +181,7 @@ async def cmd_start(message: types.Message):
         keyboard = InlineKeyboardMarkup(row_width=1)
         buttons = [
             InlineKeyboardButton("Выбрать маркетплейс", callback_data="choose_marketplace"),
-            InlineKeyboardButton("Добавить маркетплейс", url=f"{EXTERNAL_BACKEND_URL}/auth?token={auth_token}&action=add_marketplace"),
+            InlineKeyboardButton("Управление кабинетами", url=f"{EXTERNAL_BACKEND_URL}/add_marketplace?token={auth_token}"),
             InlineKeyboardButton("Помощь", callback_data="help")
         ]
         keyboard.add(*buttons)
@@ -211,23 +261,22 @@ async def process_marketplace_selection(callback_query: types.CallbackQuery, mar
     await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
 
 # Обработчик кнопки "Получить свежий отзыв"
-@dp.message_handler(lambda message: message.text.startswith("Получить свежий отзыв"))
+@dp.message_handler(lambda message: message.text == "Получить свежий отзыв")
 async def get_fresh_review(message: types.Message):
     user_data = await storage.get_data(user=message.from_user.id)
-    marketplace = user_data.get('selected_marketplace')
-    if not marketplace:
-        await message.answer("Сначала выберите маркетплейс. Нажмите /start для выбора.")
+    account_id = user_data.get('selected_account_id')
+    if not account_id:
+        await message.answer("Сначала выберите кабинет. Нажмите /start для выбора.")
         return
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{BACKEND_URL}/get_review", params={
             'telegram_id': message.from_user.id,
-            'marketplace': marketplace
+            'account_id': account_id
         }) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 review = data.get('review')
-                # Не удаляем сообщение с отзывом
-                await message.answer(f"Свежий отзыв с {marketplace}:\n\n{review}")
+                await message.answer(f"Свежий отзыв:\n\n{review}")
             else:
                 await message.answer("Не удалось получить отзыв. Пожалуйста, попробуйте позже.")
 

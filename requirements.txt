@@ -9,6 +9,7 @@ aiohttp
 python-multipart
 pydantic
 alembic
+openai
 
 
 

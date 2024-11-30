@@ -276,7 +276,8 @@ async def get_fresh_review(message: types.Message):
             if resp.status == 200:
                 data = await resp.json()
                 review = data.get('review')
-                await message.answer(f"Свежий отзыв:\n\n{review}")
+                reply = data.get('reply')
+                await message.answer(f"{review}\n\nСгенерированный нейросетью ответ:\n{reply}")
             else:
                 await message.answer("Не удалось получить отзыв. Пожалуйста, попробуйте позже.")
 

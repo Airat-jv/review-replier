@@ -20,3 +20,12 @@ venv/
 # Игнорировать файл .DS_Store (Desktop Services Store)
 .DS_Store
 
+# Исключить все папки __pycache__
+__pycache__/
+
+# Исключить файлы компиляции Python
+*.py[cod]
+*$py.class
+
+# Исключить __pycache__ внутри alembic (если есть)
+alembic/__pycache__/

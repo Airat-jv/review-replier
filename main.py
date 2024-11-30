@@ -1,8 +1,9 @@
 # main.py
-
 import os
 import json
 import uuid
+import requests
+import openai
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, ForeignKey
@@ -33,6 +34,9 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Убедитесь, что ключ API передан
+openai.api_key = os.getenv('OPENAI_API_KEY')
+
 # Модели
 class Company(Base):
     __tablename__ = 'companies'
@@ -61,6 +65,8 @@ class MarketplaceAccount(Base):
     marketplace = Column(String)
     account_name = Column(String)
     api_key = Column(String)
+    business_id = Column(String)  # Добавили поле для businessId
+    business_name = Column(String)  # Добавили поле для businessName
     user = relationship("User", back_populates="marketplace_accounts")
 
 # Создание таблиц
@@ -127,7 +133,7 @@ async def auth_form(token: str, action: str = None, db: Session = Depends(get_db
     """
     return HTMLResponse(content=html_content)
 
-# Эндпоинт для авторизации (POST)
+# Эндпоинт для первичной авторизации (POST)
 @app.post('/auth', response_class=HTMLResponse)
 async def auth_submit(request: Request, db: Session = Depends(get_db)):
     form_data = await request.form()
@@ -162,12 +168,43 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
     for marketplace in supported_marketplaces:
         api_key = form_data.get(f"{marketplace}_api_key")
         if api_key:
-            account_name = form_data.get(f"{marketplace}_account_name", f"Кабинет {marketplace}")
+            if marketplace == 'Яндекс.Маркет':
+                # Запрашиваем информацию о бизнесе
+                headers = {
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json'
+                }
+                params = {
+                    'page': 1,
+                    'pageSize': 1  # Вы можете установить нужный размер страницы
+                }
+                response = requests.get('https://api.partner.market.yandex.ru/campaigns', headers=headers, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    campaigns = data.get('campaigns', [])
+                    if not campaigns:
+                        # Если список кампаний пуст
+                        return HTMLResponse(content="<h2>Не найдено ни одной кампании для данного API-ключа.</h2>")
+                    else:
+                        # Обрабатываем полученные кампании
+                        campaign = campaigns[0]
+                        business_id = campaign['business']['id']
+                        business_name = campaign['business']['name']
+                else:
+                    return HTMLResponse(content=f"<h2>Ошибка при получении информации о бизнесе: {response.status_code}</h2><pre>{response.text}</pre>")
+            else:
+                # Для других маркетплейсов
+                business_id = None
+                business_name = None
+
+            # Сохраняем данные в базе
             new_account = MarketplaceAccount(
                 user_id=user.id,
                 marketplace=marketplace,
-                account_name=account_name,
-                api_key=api_key
+                account_name=business_name or 'Кабинет',
+                api_key=api_key,
+                business_id=business_id,
+                business_name=business_name
             )
             db.add(new_account)
 
@@ -178,12 +215,19 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
     company_name = company.name if company else "вашей компании"
 
     return HTMLResponse(content=f"""
-    <h2>Данные успешно сохранены.</h2>
-    <p>Вы можете вернуться в бот, чтобы продолжить работу.</p>
-    <a href="tg://resolve?domain={bot_username}">Перейти в бот</a>
+    <h2>Здравствуйте, {user.name}!</h2>
+    <p>Вы успешно зарегистрировались в системе как сотрудник компании '{company_name}'.</p>
+    <p>Вы будете перенаправлены в бот через несколько секунд...</p>
+    <script>
+        setTimeout(function() {{
+            window.location.href = "https://t.me/{bot_username}";
+        }}, 3000); // Задержка в 3 секунды
+    </script>
     """)
+#     <p>Вы можете вернуться в бот, чтобы продолжить работу.</p>
+#     <a href="tg://resolve?domain={bot_username}">Перейти в бот</a>
 
-# эндпоинт для добавления кабинетов
+# эндпоинт для добавления кабинетов (GET)
 @app.get('/add_marketplace', response_class=HTMLResponse)
 async def add_marketplace_form(token: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.auth_token == token).first()
@@ -207,9 +251,7 @@ async def add_marketplace_form(token: str, db: Session = Depends(get_db)):
                 <select id="marketplace" name="marketplace">
                     {marketplaces_options}
                 </select><br><br>
-                <label for="account_name">Название кабинета:</label>
-                <input type="text" id="account_name" name="account_name" required><br><br>
-                <label for="api_key">API-ключ:</label>
+                <label for="api_key">API-ключ (OAuth-токен):</label>
                 <input type="text" id="api_key" name="api_key" required><br><br>
                 <button type="submit">Сохранить</button>
             </form>
@@ -228,25 +270,54 @@ async def add_marketplace_submit(request: Request, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail='Invalid token')
 
     marketplace = form_data.get('marketplace')
-    account_name = form_data.get('account_name')
-    if not account_name:
-        return HTMLResponse(content="<h2>Название кабинета обязательно для заполнения.</h2>")
     api_key = form_data.get('api_key')
 
+    if marketplace == 'Яндекс.Маркет':
+        # Запрашиваем информацию о бизнесе
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        }
+        params = {
+            'page': 1,
+            'pageSize': 1  # Вы можете установить нужный размер страницы
+        }
+        response = requests.get('https://api.partner.market.yandex.ru/campaigns', headers=headers, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            campaigns = data.get('campaigns', [])
+            if not campaigns:
+                # Если список кампаний пуст
+                return HTMLResponse(content="<h2>Не найдено ни одной кампании для данного API-ключа.</h2>")
+            else:
+                # Обрабатываем полученные кампании
+                campaign = campaigns[0]
+                business_id = campaign['business']['id']
+                business_name = campaign['business']['name']
+        else:
+            return HTMLResponse(content=f"<h2>Ошибка при получении информации о бизнесе: {response.status_code}</h2><pre>{response.text}</pre>")
+    else:
+        # Для других маркетплейсов
+        business_id = None
+        business_name = None
+
+    # Сохраняем данные в базе
     new_account = MarketplaceAccount(
         user_id=user.id,
         marketplace=marketplace,
-        account_name=account_name,
-        api_key=api_key
+        account_name=business_name or 'Кабинет',
+        api_key=api_key,
+        business_id=business_id,
+        business_name=business_name
     )
     db.add(new_account)
     db.commit()
 
-    # Возвращаем сообщение об успешном сохранении
+    # Возвращаем сообщение об успешном добавлении
     bot_username = os.getenv('BOT_USERNAME', 'your_bot_username')
-
     return HTMLResponse(content=f"""
-    <h2>Кабинет успешно добавлен.</h2>
+    <h2>Кабинет '{business_name}' успешно добавлен.</h2>
+    <p>Маркетплейс: {marketplace}</p>
     <p>Вы можете вернуться в бот, чтобы продолжить работу.</p>
     <a href="tg://resolve?domain={bot_username}">Перейти в бот</a>
     """)
@@ -299,7 +370,6 @@ async def user_info(telegram_id: int, db: Session = Depends(get_db)):
     else:
         raise HTTPException(status_code=404, detail='User not found')
 
-# # Эндпоинт для получения списка маркетплейсов пользователя
 # Эндпоинт для получения кабинетов пользователя
 @app.get('/get_user_marketplace_accounts')
 async def get_user_marketplace_accounts(telegram_id: int, db: Session = Depends(get_db)):
@@ -330,7 +400,107 @@ async def get_review(telegram_id: int, account_id: int, db: Session = Depends(ge
     if not account:
         raise HTTPException(status_code=400, detail='Marketplace account not found')
 
-    # Здесь реализуйте логику получения отзыва, используя account.api_key
-    review = f"Пример отзыва с {account.marketplace} - {account.account_name}"
+    if account.marketplace == 'Яндекс.Маркет':
+        review = get_last_review_yandex(account)
+    else:
+        raise HTTPException(status_code=400, detail='Marketplace not supported yet')
 
-    return {'review': review}
+    # Синхронный вызов функции генерации ответа
+    reply = generate_reply_to_review(review)
+
+    return {'review': review, 'reply': reply}
+
+
+# функция получения отзыва
+def get_last_review_yandex(account: MarketplaceAccount):
+    import requests
+
+    token = account.api_key
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    business_id = account.business_id
+    if not business_id:
+        raise HTTPException(status_code=400, detail='Business ID not found for this account')
+
+    # Правильный эндпоинт для получения отзывов
+    url = f'https://api.partner.market.yandex.ru/v2/businesses/{business_id}/goods-feedback'
+
+    params = {
+        'limit': 1  # Получаем последний отзыв
+    }
+
+    data = {
+        'reactionStatus': 'NEED_REACTION',
+        'paid': False
+    }
+
+    response = requests.post(url, headers=headers, params=params, json=data)
+    if response.status_code == 200:
+        data = response.json()
+        feedbacks = data.get('result', {}).get('feedbacks', [])
+        if feedbacks:
+            last_feedback = feedbacks[0]
+            author = last_feedback.get('author', 'Неизвестный автор')
+            description = last_feedback.get('description', {})
+            advantages = description.get('advantages', '')
+            disadvantages = description.get('disadvantages', '')
+            comment = description.get('comment', '')
+            date = last_feedback.get('createdAt', '')
+            rating = last_feedback.get('statistics', {}).get('rating', 'Нет оценки')
+
+            # Формируем текст отзыва
+            review_text = f"Отзыв от {author} ({date}):\n"
+            review_text += f"Оценка: {rating}/5\n\n"
+            if advantages:
+                review_text += f"Плюсы:\n{advantages}\n\n"
+            if disadvantages:
+                review_text += f"Минусы:\n{disadvantages}\n\n"
+            if comment:
+                review_text += f"Комментарий:\n{comment}"
+
+            return review_text 
+        else:
+            return "Нет доступных отзывов."
+    else:
+        return f"Ошибка при получении отзыва: {response.status_code}, {response.text}"
+    
+
+# Асинхронная функция для генерации ответа на отзыв
+def generate_reply_to_review(review_text: str) -> str:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты профессиональный менеджер по работе с клиентами, который отвечает на отзывы клиентов на маркетплейсе. "
+                "Всегда отвечай вежливо и профессионально."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Отзыв клиента:\n{review_text}\n\nСгенерируй вежливый и профессиональный ответ на отзыв клиента."
+        }
+    ]
+
+    try:
+        # Синхронный вызов API
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            max_tokens=150,
+            temperature=0.7,
+        )
+        # Используем атрибуты объекта для доступа к данным
+        reply = response.choices[0].message.content.strip()
+        return reply
+    except Exception as e:
+        # Логирование ошибки
+        print(f"Error in generate_reply_to_review: {e}")
+        return "Не удалось сгенерировать ответ на отзыв."
+
+
+
+

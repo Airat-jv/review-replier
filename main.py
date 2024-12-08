@@ -4,7 +4,7 @@ import json
 import uuid
 import requests
 import openai
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, Body
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
@@ -401,14 +401,14 @@ async def get_review(telegram_id: int, account_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail='Marketplace account not found')
 
     if account.marketplace == 'Яндекс.Маркет':
-        review = get_last_review_yandex(account)
+        review, review_id = get_last_review_yandex(account)
     else:
         raise HTTPException(status_code=400, detail='Marketplace not supported yet')
 
     # Синхронный вызов функции генерации ответа
     reply = generate_reply_to_review(review)
 
-    return {'review': review, 'reply': reply}
+    return {'review': review, 'reply': reply, 'review_id': review_id}
 
 
 # функция получения отзыва
@@ -444,6 +444,7 @@ def get_last_review_yandex(account: MarketplaceAccount):
         feedbacks = data.get('result', {}).get('feedbacks', [])
         if feedbacks:
             last_feedback = feedbacks[0]
+            review_id = last_feedback.get('feedbackId')
             author = last_feedback.get('author', 'Неизвестный автор')
             description = last_feedback.get('description', {})
             advantages = description.get('advantages', '')
@@ -462,14 +463,14 @@ def get_last_review_yandex(account: MarketplaceAccount):
             if comment:
                 review_text += f"Комментарий:\n{comment}"
 
-            return review_text 
+            return review_text, review_id
         else:
-            return "Нет доступных отзывов."
+            return "Нет доступных отзывов.", None
     else:
         return f"Ошибка при получении отзыва: {response.status_code}, {response.text}"
     
 
-# Асинхронная функция для генерации ответа на отзыв
+# Cинхронная функция для генерации ответа на отзыв
 def generate_reply_to_review(review_text: str) -> str:
     messages = [
         {
@@ -481,7 +482,7 @@ def generate_reply_to_review(review_text: str) -> str:
         },
         {
             "role": "user",
-            "content": f"Отзыв клиента:\n{review_text}\n\nСгенерируй вежливый и профессиональный ответ на отзыв клиента."
+            "content": f"Отзыв клиента:\n{review_text}\n\nСгенерируй вежливый и профессиональный ответ на отзыв клиента, не более 200 символов."
         }
     ]
 
@@ -490,7 +491,7 @@ def generate_reply_to_review(review_text: str) -> str:
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
-            max_tokens=150,
+            max_tokens=300,
             temperature=0.7,
         )
         # Используем атрибуты объекта для доступа к данным
@@ -500,6 +501,73 @@ def generate_reply_to_review(review_text: str) -> str:
         # Логирование ошибки
         print(f"Error in generate_reply_to_review: {e}")
         return "Не удалось сгенерировать ответ на отзыв."
+    
+# Эндпоинт для 
+@app.post('/send_reply')
+async def send_reply(data: dict = Body(...), db: Session = Depends(get_db)):
+    telegram_id = data.get('telegram_id')
+    account_id = data.get('account_id')
+    reply_text = data.get('reply')
+    review_id = data.get('review_id')  # Получаем review_id из данных
+
+    # Проверяем наличие необходимых данных
+    if not all([telegram_id, account_id, reply_text, review_id]):
+        raise HTTPException(status_code=400, detail='Missing required data')
+
+    # Остальной код без изменений
+    user = db.query(User).filter(User.telegram_id == telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=400, detail='User not authorized')
+
+    account = db.query(MarketplaceAccount).filter(
+        MarketplaceAccount.id == account_id,
+        MarketplaceAccount.user_id == user.id
+    ).first()
+    if not account:
+        raise HTTPException(status_code=400, detail='Marketplace account not found')
+
+    if account.marketplace == 'Яндекс.Маркет':
+        success = send_reply_to_yandex_market(account, review_id, reply_text)
+        if success:
+            return {'status': 'success'}
+        else:
+            raise HTTPException(status_code=500, detail='Failed to send reply to Yandex Market')
+    else:
+        raise HTTPException(status_code=400, detail='Marketplace not supported yet')
+
+# Функция отправки ответа
+def send_reply_to_yandex_market(account: MarketplaceAccount, review_id: int, reply_text: str) -> bool:
+    token = account.api_key
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+
+    # Используем businessId из аккаунта
+    business_id = account.business_id
+    if not business_id:
+        print("Error: No business_id found for this account")
+        return False
+
+    # Новый URL по актуальной документации
+    url = f'https://api.partner.market.yandex.ru/businesses/{business_id}/goods-feedback/comments/update'
+
+    data = {
+        "feedbackId": review_id,
+        "comment": {
+            # id не указываем или ставим 0 для создания нового комментария
+#             "id": 0,
+#             "parentId": 0,
+            "text": reply_text
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        return True
+    else:
+        print(f"Error sending reply to Yandex Market: {response.status_code}, {response.text}")
+        return False
 
 
 

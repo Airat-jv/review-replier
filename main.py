@@ -388,7 +388,7 @@ async def get_user_marketplace_accounts(telegram_id: int, db: Session = Depends(
 
 # Эндпоинт для получения свежего отзыва
 @app.get('/get_review')
-async def get_review(telegram_id: int, account_id: int, db: Session = Depends(get_db)):
+async def get_review(telegram_id: int, account_id: int, page_token: str = None, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
     if not user:
         raise HTTPException(status_code=400, detail='User not authorized')
@@ -401,20 +401,26 @@ async def get_review(telegram_id: int, account_id: int, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail='Marketplace account not found')
 
     if account.marketplace == 'Яндекс.Маркет':
-        review, review_id = get_last_review_yandex(account)
+        review, review_id, next_page_token = get_last_review_yandex(account, page_token)
     else:
         raise HTTPException(status_code=400, detail='Marketplace not supported yet')
 
-    # Синхронный вызов функции генерации ответа
-    reply = generate_reply_to_review(review)
+    # Генерируем ответ
+    if review_id:
+        reply = generate_reply_to_review(review)
+    else:
+        reply = ""
 
-    return {'review': review, 'reply': reply, 'review_id': review_id}
+    return {
+        'review': review,
+        'reply': reply,
+        'review_id': review_id,
+        'next_page_token': next_page_token
+    }
 
 
 # функция получения отзыва
-def get_last_review_yandex(account: MarketplaceAccount):
-    import requests
-
+def get_last_review_yandex(account: MarketplaceAccount, page_token: str = None):
     token = account.api_key
 
     headers = {
@@ -426,12 +432,14 @@ def get_last_review_yandex(account: MarketplaceAccount):
     if not business_id:
         raise HTTPException(status_code=400, detail='Business ID not found for this account')
 
-    # Правильный эндпоинт для получения отзывов
     url = f'https://api.partner.market.yandex.ru/v2/businesses/{business_id}/goods-feedback'
 
+    # Параметры запроса
     params = {
-        'limit': 1  # Получаем последний отзыв
+        'limit': 1
     }
+    if page_token:
+        params['page_token'] = page_token
 
     data = {
         'reactionStatus': 'NEED_REACTION',
@@ -442,6 +450,8 @@ def get_last_review_yandex(account: MarketplaceAccount):
     if response.status_code == 200:
         data = response.json()
         feedbacks = data.get('result', {}).get('feedbacks', [])
+        next_page_token = data.get('result', {}).get('paging', {}).get('nextPageToken')
+        
         if feedbacks:
             last_feedback = feedbacks[0]
             review_id = last_feedback.get('feedbackId')
@@ -453,7 +463,6 @@ def get_last_review_yandex(account: MarketplaceAccount):
             date = last_feedback.get('createdAt', '')
             rating = last_feedback.get('statistics', {}).get('rating', 'Нет оценки')
 
-            # Формируем текст отзыва
             review_text = f"Отзыв от {author} ({date}):\n"
             review_text += f"Оценка: {rating}/5\n\n"
             if advantages:
@@ -463,11 +472,11 @@ def get_last_review_yandex(account: MarketplaceAccount):
             if comment:
                 review_text += f"Комментарий:\n{comment}"
 
-            return review_text, review_id
+            return review_text, review_id, next_page_token
         else:
-            return "Нет доступных отзывов.", None
+            return "Нет доступных отзывов.", None, None
     else:
-        return f"Ошибка при получении отзыва: {response.status_code}, {response.text}"
+        return f"Ошибка при получении отзыва: {response.status_code}, {response.text}", None, None
     
 
 # Cинхронная функция для генерации ответа на отзыв

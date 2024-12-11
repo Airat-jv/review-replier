@@ -5,8 +5,6 @@ import aiohttp
 import json
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import BotCommand, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # Получаем переменные окружения
@@ -21,11 +19,6 @@ if not TELEGRAM_TOKEN:
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
-# Создадим класс состояний
-class ReviewStates(StatesGroup):
-    waiting_for_custom_reply = State()
-    confirming_reply = State()
 
 # Установка команд бота
 async def set_default_commands(dp):
@@ -100,18 +93,19 @@ async def send_marketplace_selection(chat_id):
     keyboard = InlineKeyboardMarkup(row_width=1)
     for mp, accs in marketplaces.items():
         if len(accs) == 1:
-            # Если один кабинет, добавляем кнопку сразу для него
             callback_data = f"select_account:{accs[0]['id']}"
             button = InlineKeyboardButton(text=f"{mp} - {accs[0]['account_name']}", callback_data=callback_data)
             keyboard.add(button)
         else:
-            # Если несколько кабинетов, добавляем кнопку для выбора кабинета
             callback_data = f"choose_account:{mp}"
             button = InlineKeyboardButton(text=f"{mp}", callback_data=callback_data)
             keyboard.add(button)
-    await delete_previous_bot_message(chat_id)
+
+    # Передаем chat_id и user_id одинаково
+    await delete_previous_bot_message(chat_id, chat_id)
     sent_message = await bot.send_message(chat_id, "Пожалуйста, выберите маркетплейс или кабинет:", reply_markup=keyboard)
-    await storage.update_data(user=chat_id, data={'last_bot_message_id': sent_message.message_id})
+    await storage.update_data(chat=chat_id, user=chat_id, data={'last_bot_message_id': sent_message.message_id})
+
 
 # Функция для Обработать выбор кабинета
 @dp.callback_query_handler(lambda c: c.data.startswith('choose_account:'))
@@ -126,53 +120,55 @@ async def process_choose_account(callback_query: types.CallbackQuery):
         keyboard.add(button)
     await delete_previous_bot_message(callback_query.from_user.id)
     sent_message = await bot.send_message(callback_query.from_user.id, "Выберите кабинет:", reply_markup=keyboard)
-    await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+    
+    chat_id = callback_query.message.chat.id
+    user_id = callback_query.from_user.id
+    await storage.update_data(chat=chat_id, user=user_id, data={'last_bot_message_id': sent_message.message_id})
+
     await callback_query.answer()
 
-# Функция для Обработать выбор аккаунта
+# Функция для Обработать выбор кабинет
 @dp.callback_query_handler(lambda c: c.data.startswith('select_account:'))
 async def process_select_account(callback_query: types.CallbackQuery):
-    account_id = int(callback_query.data.split(':')[1])
-    # Сохраняем выбранный аккаунт
-    await storage.update_data(user=callback_query.from_user.id, data={'selected_account_id': account_id})
+    chat_id = callback_query.message.chat.id
+    user_id = callback_query.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
 
-    # Получаем информацию о кабинете
-    accounts = await get_user_marketplace_accounts(callback_query.from_user.id)
-    # Ищем выбранный кабинет по account_id
+    account_id = int(callback_query.data.split(':')[1])
+
+    # Сначала получаем account_info
+    accounts = await get_user_marketplace_accounts(user_id)
     account_info = next((acc for acc in accounts if acc['id'] == account_id), None)
 
-    if account_info:
-        account_name = account_info.get('account_name')
-        marketplace = account_info.get('marketplace')
+    if account_info is None:
+        await bot.send_message(chat_id, "Не удалось получить информацию о выбранном кабинете.")
+        return
 
-        # Сохраняем marketplace в данных пользователя
-        await storage.update_data(user=callback_query.from_user.id, data={'marketplace': marketplace})
+    # Теперь, когда мы знаем account_info, мы можем использовать его
+    marketplace = account_info.get('marketplace')
+    user_data['selected_account_id'] = account_id
+    user_data['marketplace'] = marketplace
+    user_data['next_page_token'] = None
+    await storage.update_data(chat=chat_id, user=user_id, data=user_data)
 
-        # Отправляем сообщение с названием кабинета и маркетплейса
-        await delete_previous_bot_message(callback_query.from_user.id)
-        await bot.send_message(
-            chat_id=callback_query.from_user.id,
-            text=f"Вы выбрали кабинет *{account_name}* на *{marketplace}*.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    account_name = account_info.get('account_name')
 
-        # Отправляем основное меню с кнопкой "Получить свежий отзыв" и иконкой
-        await send_main_menu(callback_query.from_user.id, marketplace)
-    else:
-        await bot.send_message(
-            chat_id=callback_query.from_user.id,
-            text="Не удалось получить информацию о выбранном кабинете."
-        )
+    await delete_previous_bot_message(chat_id, user_id)
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"Вы выбрали кабинет *{account_name}* на *{marketplace}*.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    await send_main_menu(user_id, marketplace)
     await callback_query.answer()
 
 # Функция для отправки основного меню
 async def send_main_menu(user_id: int, marketplace: str):
-    # Получаем иконку
-    icon = get_marketplace_icon(marketplace)
 
     # Создаём клавиатуру
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    button_text = f"Получить свежий отзыв {icon}"
+    button_text = "Получить отзыв"
     keyboard.add(button_text)
 
     # Отправляем сообщение с клавиатурой
@@ -183,8 +179,8 @@ async def send_main_menu(user_id: int, marketplace: str):
     )
 
 # Функция для удаления предыдущего сообщения бота
-async def delete_previous_bot_message(chat_id):
-    user_data = await storage.get_data(user=chat_id)
+async def delete_previous_bot_message(chat_id, user_id):
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
     last_message_id = user_data.get('last_bot_message_id')
     if last_message_id:
         try:
@@ -192,22 +188,19 @@ async def delete_previous_bot_message(chat_id):
         except:
             pass  # Если сообщение уже удалено или недоступно
 
-# Функция для получения иконки маркетплейса
-def get_marketplace_icon(marketplace):
-    icons = {
-        'Яндекс.Маркет': '🟡',
-        'OZON': '🔵',
-        'Wildberries': '🟣'
-    }
-    return icons.get(marketplace, '')
-
 # Обработчик команды /start
-@dp.message_handler(commands=['start'], state='*')
-async def cmd_start(message: types.Message, state: FSMContext):
-    print("Обработчик /start вызван")
-    await state.finish()  # Сброс состояния
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    # Если нужно очистить данные, делаем это через user_data
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+    user_data.clear()
+    await storage.update_data(chat=chat_id, user=user_id, data=user_data)
+
+    # Далее логика старта без state.finish()
     is_authorized = await check_authorization(message.from_user.id)
-    await delete_previous_bot_message(message.chat.id)  # Удаляем предыдущее сообщение
+    await delete_previous_bot_message(chat_id, user_id)  # Удаляем предыдущее сообщение
     if is_authorized:
         # Удаляем клавиатуру
         await message.answer("Пожалуйста, выберите маркетплейс:", reply_markup=types.ReplyKeyboardRemove())
@@ -240,7 +233,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 reply_markup=keyboard
             )
         # Сохраняем message_id
-        await storage.update_data(user=message.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+        await storage.update_data(chat=chat_id, user=message.from_user.id, data={'last_bot_message_id': sent_message.message_id})
     else:
         token = await generate_token(message.from_user.id)
         keyboard = InlineKeyboardMarkup(row_width=1)
@@ -254,12 +247,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
             reply_markup=keyboard
         )
         # Сохраняем message_id
-        await storage.update_data(user=message.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+        await storage.update_data(chat=chat_id, user=message.from_user.id, data={'last_bot_message_id': sent_message.message_id})
 
 # Обработчик команды /help
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: types.Message):
-    await delete_previous_bot_message(message.chat.id)  # Удаляем предыдущее сообщение
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+    await delete_previous_bot_message(chat_id, user_id)  # В delete_previous_bot_message тоже нужно изменить сигнатуру
+    
     help_text = (
         "ℹ️ *Популярные вопросы:*\n\n"
         "🔹 *Как авторизоваться?*\n"
@@ -272,7 +269,8 @@ async def cmd_help(message: types.Message):
     )
     sent_message = await message.answer(help_text, parse_mode=types.ParseMode.MARKDOWN)
     # Сохраняем message_id
-    await storage.update_data(user=message.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+    user_data['last_bot_message_id'] = sent_message.message_id
+    await storage.update_data(chat=chat_id, user=user_id, data=user_data)
 
 # Обработчик нажатия на инлайн-кнопки
 @dp.callback_query_handler(lambda c: True)
@@ -290,10 +288,10 @@ async def process_callback(callback_query: types.CallbackQuery):
 # Обработчик выбора маркетплейса
 async def process_marketplace_selection(callback_query: types.CallbackQuery, marketplace: str):
     # Сохраняем выбранный маркетплейс
-    await storage.update_data(user=callback_query.from_user.id, data={'selected_marketplace': marketplace})
+    await storage.update_data(chat=chat_id, user=callback_query.from_user.id, data={'selected_marketplace': marketplace})
     # Создаём обычную клавиатуру с кнопкой "Получить свежий отзыв"
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    button_text = f"Получить свежий отзыв {get_marketplace_icon(marketplace)}"
+    button_text = f"Получить отзыв {get_marketplace_icon(marketplace)}"
     keyboard.add(button_text)
     # Удаляем предыдущее сообщение
     await delete_previous_bot_message(callback_query.from_user.id)
@@ -304,7 +302,7 @@ async def process_marketplace_selection(callback_query: types.CallbackQuery, mar
         reply_markup=keyboard
     )
     # Сохраняем message_id
-    await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+    await storage.update_data(chat=chat_id, user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
 
 # Обработчик для выбора маркетплейса, который затем предлагает выбрать кабинет
 @dp.callback_query_handler(lambda c: c.data.startswith('choose_marketplace:'))
@@ -321,191 +319,182 @@ async def process_choose_marketplace(callback_query: types.CallbackQuery):
             keyboard.add(button)
         await delete_previous_bot_message(callback_query.from_user.id)
         sent_message = await bot.send_message(callback_query.from_user.id, "Выберите кабинет:", reply_markup=keyboard)
-        await storage.update_data(user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
+        await storage.update_data(chat=chat_id, user=callback_query.from_user.id, data={'last_bot_message_id': sent_message.message_id})
     else:
         await bot.send_message(callback_query.from_user.id, "У вас нет кабинетов на выбранном маркетплейсе.")
     await callback_query.answer()
 
-# Обработчик кнопки "Получить свежий отзыв"
-@dp.message_handler(lambda message: message.text.startswith("Получить свежий отзыв"))
-async def get_fresh_review(message: types.Message, state: FSMContext):
-    user_data = await storage.get_data(user=message.from_user.id)
+# Обработчик кнопки "Получить отзыв" и еще "Перейти к следующему"
+@dp.message_handler(lambda message: message.text in ["Получить отзыв", "Перейти к следующему"])
+async def handle_review_actions(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+
+    # Отправляем промежуточное сообщение
+    loading_message = await message.answer("🤖Получаем данные… \n✨Генерируем ответ… ")
+
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
     account_id = user_data.get('selected_account_id')
     if not account_id:
+        # Перед тем как ответить пользователю, удаляем промежуточное сообщение
+        await bot.delete_message(chat_id=chat_id, message_id=loading_message.message_id)
         await message.answer("Сначала выберите кабинет. Нажмите /start для выбора.")
         return
+
+    # Определяем, нужно ли использовать next_page_token
+    page_token = None
+    if "Перейти к следующему" in message.text:
+        page_token = user_data.get('next_page_token')
+
+    # Делаем запрос к бэкенду
+    params = {
+        'telegram_id': user_id,
+        'account_id': account_id
+    }
+    if page_token:
+        params['page_token'] = page_token
+
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"{BACKEND_URL}/get_review", params={
-            'telegram_id': message.from_user.id,
-            'account_id': account_id
-        }) as resp:
+        async with session.get(f"{BACKEND_URL}/get_review", params=params) as resp:
+
+            # Удаляем промежуточное сообщение перед тем как отправить итоговый ответ
+            await bot.delete_message(chat_id=chat_id, message_id=loading_message.message_id)
+
             if resp.status == 200:
                 data = await resp.json()
                 review = data.get('review')
                 reply = data.get('reply')
-                review_id = data.get('review_id')  # Получаем review_id из ответа
+                review_id = data.get('review_id')
+                new_next_page_token = data.get('next_page_token')
 
-                # Отправляем отзыв отдельным сообщением
-                await message.answer(f"**Свежий отзыв:**\n\n{review}", parse_mode=ParseMode.MARKDOWN)
+                if review_id:
+                    # Сохраняем данные
+                    user_data['review'] = review
+                    user_data['suggested_reply'] = reply
+                    user_data['review_id'] = review_id
+                    user_data['next_page_token'] = new_next_page_token
+                    user_data['current_mode'] = None
+                    await storage.update_data(chat=chat_id, user=user_id, data=user_data)
 
-                # Уведомляем, что сейчас пришлём сгенерированный ответ
-#                 await message.answer("Сейчас пришлём вам сгенерированный нейросетью ответ. Если он вас устраивает, можете нажать кнопку 'Отправить предложенный ответ' или можете написать свой.")
+                    await message.answer(f"**Отзыв:**\n\n{review}", parse_mode=ParseMode.MARKDOWN)
+                    await message.answer(f"**Предлагаемый ответ:**\n\n{reply}", parse_mode=ParseMode.MARKDOWN)
 
-                # Отправляем сгенерированный ответ
-                await message.answer(f"**Предлагаемый ответ:**\n\n{reply}", parse_mode=ParseMode.MARKDOWN)
-
-                # Сохраняем данные в состоянии, включая review_id
-                await state.update_data(
-                    review=review,
-                    suggested_reply=reply,
-                    account_id=account_id,
-                    review_id=review_id  # Здесь мы сохраняем review_id
-                )
-
-                # Создаём новую клавиатуру с кнопками
-                keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-                keyboard.add("Отправить предложенный ответ", "Написать свой ответ")
-                keyboard.add("Отмена")
-
-                await message.answer("Выберите действие:", reply_markup=keyboard)
+                    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+                    keyboard.add("Отправить предложенный ответ", "Написать свой ответ")
+                    keyboard.add("Перейти к следующему")
+                    await message.answer("Выберите действие:", reply_markup=keyboard)
+                else:
+                    await message.answer("Больше нет отзывов.")
+                    user_data['current_mode'] = None
+                    await storage.update_data(chat=chat_id, user=user_id, data=user_data)
+                    await send_main_menu(user_id, user_data.get('marketplace'))
             else:
                 await message.answer("Не удалось получить отзыв. Пожалуйста, попробуйте позже.")
 
 # Обработка нажатий на новые кнопки 
 @dp.message_handler(lambda message: message.text in ["Отправить предложенный ответ", "Написать свой ответ"])
-async def handle_reply_choice(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
+async def handle_reply_choice(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+
     if message.text == "Отправить предложенный ответ":
-        # Отправляем предложенный ответ
-        await send_user_reply(message, state, user_data['suggested_reply'])
+        suggested_reply = user_data.get('suggested_reply')
+        if suggested_reply is None:
+            await message.answer("Предложенный ответ не найден. Попробуйте снова получить отзыв.")
+            return
+
+        success = await send_user_reply(message, suggested_reply)
+        if success:
+            await message.answer("Ответ успешно отправлен на Яндекс.Маркет.")
+        else:
+            await message.answer("Не удалось отправить ответ. Пожалуйста, попробуйте позже.")
+
+        user_data['current_mode'] = None
+        await storage.update_data(chat=chat_id, user=user_id, data=user_data)
+        await send_main_menu(user_id, user_data.get('marketplace'))
+
     elif message.text == "Написать свой ответ":
+        user_data['current_mode'] = 'waiting_for_custom_reply'
+        await storage.update_data(chat=chat_id, user=user_id, data=user_data)
         await message.answer("Пожалуйста, напишите ваш ответ на отзыв.")
-        await ReviewStates.waiting_for_custom_reply.set()
 
-# Функция для отправки ответа
-async def send_user_reply(message: types.Message, state: FSMContext, reply_text: str):
-    user_data = await state.get_data()
-    # Вызов функции отправки ответа на бэкенд
-    success = await send_reply_to_marketplace(
-        telegram_id=message.from_user.id,
-        account_id=user_data['account_id'],
-        review_id=user_data['review_id'],
-        reply=reply_text
-    )
-    if success:
-        await message.answer("Ответ успешно отправлен на Яндекс.Маркет.")
+# Функция отправки ответа на Яндекс.Маркет
+async def send_user_reply(message: types.Message, custom_reply: str) -> bool:
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+
+    account_id = user_data.get('selected_account_id')
+    review_id = user_data.get('review_id')
+
+    if not account_id or not review_id:
+        # Если не хватает данных, возвращаем False
+        return False
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(f"{BACKEND_URL}/send_reply", json={
+            'telegram_id': user_id,
+            'account_id': account_id,
+            'review_id': review_id,
+            'reply': custom_reply
+        }) as resp:
+            return resp.status == 200
+
+# Обработка подтверждения отправки пользовательского ответа (когда мы уже на этапе подтверждения)
+@dp.message_handler(lambda message: message.text in ["Да, отправить", "Нет, изменить"])
+async def process_confirmation(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
+
+    if user_data.get('current_mode') == 'confirming_reply':
+        if message.text == "Да, отправить":
+            await message.answer("Отправляем ваш ответ...")
+            custom_reply = user_data.get('custom_reply')
+            success = await send_user_reply(message, custom_reply)
+            if success:
+                await message.answer("Ответ успешно отправлен на Яндекс.Маркет.")
+            else:
+                await message.answer("Не удалось отправить ответ. Пожалуйста, попробуйте позже.")
+
+            user_data['current_mode'] = None
+            await storage.update_data(chat=chat_id, user=user_id, data=user_data)
+            await send_main_menu(user_id, user_data.get('marketplace'))
+
+        elif message.text == "Нет, изменить":
+            user_data['current_mode'] = 'waiting_for_custom_reply'
+            await storage.update_data(chat=chat_id, user=user_id, data=user_data)
+            await message.answer("Пожалуйста, напишите ваш ответ на отзыв.")
     else:
-        await message.answer("Не удалось отправить ответ. Пожалуйста, попробуйте позже.")
-
-    # Возвращаем основное меню
-    await state.finish()
-    await send_main_menu(message, user_data.get('marketplace'))
+        await message.answer("Сейчас не ожидается подтверждение. Попробуйте снова.")
 
 # Обработка пользовательского ответа
-@dp.message_handler(state=ReviewStates.waiting_for_custom_reply)
-async def process_custom_reply(message: types.Message, state: FSMContext):
-    custom_reply = message.text
-    await state.update_data(custom_reply=custom_reply)
+@dp.message_handler(lambda message: True)  # был catch-all
+async def process_custom_reply(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    user_data = await storage.get_data(chat=chat_id, user=user_id)
 
-    # Подтверждение перед отправкой
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("Да, отправить", "Нет, изменить")
-    keyboard.add("Отмена")
+    # Проверяем, действительно ли мы ожидали пользовательского ответа
+    # Например, если current_mode = 'waiting_for_custom_reply'
+    if user_data.get('current_mode') == 'waiting_for_custom_reply':
+        custom_reply = message.text
+        user_data['custom_reply'] = custom_reply
+        # Переходим в режим подтверждения
+        user_data['current_mode'] = 'confirming_reply'
+        await storage.update_data(chat=chat_id, user=user_id, data=user_data)
 
-    await message.answer(f"Вы уверены, что хотите отправить этот ответ?\n\n{custom_reply}", reply_markup=keyboard)
-    await ReviewStates.confirming_reply.set()
+        # Показываем кнопки подтверждения
+        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        keyboard.add("Да, отправить", "Нет, изменить")
 
-# Обработка подтверждения
-@dp.message_handler(lambda message: message.text in ["Да, отправить", "Нет, изменить"], state=ReviewStates.confirming_reply)
-async def process_confirmation(message: types.Message, state: FSMContext):
-    if message.text == "Да, отправить":
-        user_data = await state.get_data()
-        # Отправляем пользовательский ответ
-        await send_user_reply(message, state, user_data['custom_reply'])
-    elif message.text == "Нет, изменить":
-        await message.answer("Пожалуйста, напишите ваш ответ на отзыв.")
-        await ReviewStates.waiting_for_custom_reply.set()
-
-# Обработка команды "Отмена"
-@dp.message_handler(lambda message: message.text == "Отмена", state='*')
-async def cancel_action(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer("Действие отменено.", reply_markup=types.ReplyKeyboardRemove())
-    # Возвращаем основное меню
-    user_data = await storage.get_data(user=message.from_user.id)
-    await send_main_menu(message, user_data.get('marketplace'))
-
-###
-
-# Обработчик для callback_query
-@dp.callback_query_handler(lambda c: c.data in ['send_suggested_reply', 'write_custom_reply'])
-async def process_callback_buttons(callback_query: types.CallbackQuery, state: FSMContext):
-    data = callback_query.data
-    user_data = await state.get_data()
-
-    review_id = user_data.get('review_id')  # Получаем review_id из состояния
-
-    if data == 'send_suggested_reply':
-        # Отправляем предложенный ответ на Яндекс.Маркет
-        await callback_query.message.answer("Отправляем предложенный ответ...")
-        # Вызов функции отправки ответа на бэкенд
-        success = await send_reply_to_marketplace(
-            telegram_id=callback_query.from_user.id,
-            account_id=user_data['account_id'],
-            review_id=review_id,  # Передаём review_id
-            reply=user_data['suggested_reply']
-        )
-        if success:
-            await callback_query.message.answer("Ответ успешно отправлен на Яндекс.Маркет.")
-        else:
-            await callback_query.message.answer("Не удалось отправить ответ. Пожалуйста, попробуйте позже.")
-
-    elif data == 'write_custom_reply':
-        await callback_query.message.answer("Пожалуйста, напишите ваш ответ на отзыв.")
-        await ReviewStates.waiting_for_custom_reply.set()
-
-# Обработка пользовательского ответа
-@dp.message_handler(state=ReviewStates.waiting_for_custom_reply)
-async def process_custom_reply(message: types.Message, state: FSMContext):
-    custom_reply = message.text
-    await state.update_data(custom_reply=custom_reply)
-
-    # Подтверждение перед отправкой
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(
-        InlineKeyboardButton("Да, отправить", callback_data="confirm_send_reply")
-    )
-    keyboard.add(
-        InlineKeyboardButton("Нет, изменить", callback_data="edit_reply")
-    )
-
-    await message.answer(f"Вы уверены, что хотите отправить этот ответ?\n\n{custom_reply}", reply_markup=keyboard)
-    await ReviewStates.confirming_reply.set()
-
-# Обработка подтверждения отправки пользовательского ответа
-@dp.callback_query_handler(state=ReviewStates.confirming_reply)
-async def process_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
-    data = callback_query.data
-    user_data = await state.get_data()
-
-    if data == 'confirm_send_reply':
-        await callback_query.message.answer("Отправляем ваш ответ...")
-        # Вызов функции отправки ответа на бэкенд
-        success = await send_reply_to_marketplace(
-            telegram_id=callback_query.from_user.id,
-            account_id=user_data['account_id'],
-            review=user_data['review'],
-            reply=user_data['custom_reply']
-        )
-        if success:
-            await callback_query.message.answer("Ответ успешно отправлен на Яндекс.Маркет.")
-        else:
-            await callback_query.message.answer("Не удалось отправить ответ. Пожалуйста, попробуйте позже.")
-        await state.finish()
-
-    elif data == 'edit_reply':
-        await callback_query.message.answer("Пожалуйста, напишите ваш ответ на отзыв.")
-        await ReviewStates.waiting_for_custom_reply.set()
+        await message.answer(f"Вы уверены, что хотите отправить этот ответ?\n\n{custom_reply}", reply_markup=keyboard)
+    else:
+        # Если мы не в режиме ожидания ответа, можно игнорировать или сообщить пользователю
+        # Например:
+        await message.answer("Сейчас не ожидается пользовательский ответ.")
 
 # Функция для отправки ответа на Яндекс.Маркет
 async def send_reply_to_marketplace(telegram_id: int, account_id: int, review_id: int, reply: str) -> bool:

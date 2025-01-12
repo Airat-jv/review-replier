@@ -1,0 +1,1 @@
+# pydantic Settings для конфигурации

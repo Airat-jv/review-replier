@@ -1,5 +1,5 @@
 # bot.py
-
+'''
 import os
 import aiohttp
 import json
@@ -451,7 +451,6 @@ async def process_confirmation(message: types.Message):
 
     if user_data.get('current_mode') == 'confirming_reply':
         if message.text == "Да, отправить":
-            await message.answer("Отправляем ваш ответ...")
             custom_reply = user_data.get('custom_reply')
             success = await send_user_reply(message, custom_reply)
             if success:
@@ -513,3 +512,4 @@ async def send_reply_to_marketplace(telegram_id: int, account_id: int, review_id
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
 
+'''

@@ -57,6 +57,25 @@ class User(Base):
     company = relationship("Company", back_populates="users")
     marketplace_accounts = relationship("MarketplaceAccount", back_populates="user")
 
+class Campaign(Base):
+    __tablename__ = 'campaigns'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Связь с MarketplaceAccount (который хранит api_key, business_id и т.д.)
+    marketplace_account_id = Column(Integer, ForeignKey('marketplace_accounts.id'))
+
+    # Собственно ID кампании на Я.Маркете
+    campaign_id = Column(Integer, index=True)  
+    domain = Column(String)
+    name = Column(String)           # Например, "BlackSwan"
+    placement_type = Column(String) # "FBY", "FBS" и т. п.
+
+    # Допустим, если нужно хранить ещё какие-то поля из campaigns.
+
+    # Связь обратно, если нужно
+    account = relationship("MarketplaceAccount", back_populates="campaigns")
+
 class MarketplaceAccount(Base):
     __tablename__ = 'marketplace_accounts'
 
@@ -68,6 +87,8 @@ class MarketplaceAccount(Base):
     business_id = Column(String)  # Добавили поле для businessId
     business_name = Column(String)  # Добавили поле для businessName
     user = relationship("User", back_populates="marketplace_accounts")
+
+    campaigns = relationship("Campaign", back_populates="account")
 
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
@@ -168,36 +189,32 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
     for marketplace in supported_marketplaces:
         api_key = form_data.get(f"{marketplace}_api_key")
         if api_key:
+
             if marketplace == 'Яндекс.Маркет':
-                # Запрашиваем информацию о бизнесе
+                # запрос /campaigns
                 headers = {
                     'Authorization': f'Bearer {api_key}',
                     'Content-Type': 'application/json'
                 }
                 params = {
                     'page': 1,
-                    'pageSize': 1  # Вы можете установить нужный размер страницы
+                    'pageSize': 50  # Получим побольше кампаний
                 }
                 response = requests.get('https://api.partner.market.yandex.ru/campaigns', headers=headers, params=params)
                 if response.status_code == 200:
                     data = response.json()
                     campaigns = data.get('campaigns', [])
                     if not campaigns:
-                        # Если список кампаний пуст
                         return HTMLResponse(content="<h2>Не найдено ни одной кампании для данного API-ключа.</h2>")
                     else:
-                        # Обрабатываем полученные кампании
-                        campaign = campaigns[0]
-                        business_id = campaign['business']['id']
-                        business_name = campaign['business']['name']
+                        # Берём business_id и business_name из первой кампании
+                        camp0 = campaigns[0]
+                        business_id = camp0['business']['id']
+                        business_name = camp0['business']['name']
                 else:
-                    return HTMLResponse(content=f"<h2>Ошибка при получении информации о бизнесе: {response.status_code}</h2><pre>{response.text}</pre>")
-            else:
-                # Для других маркетплейсов
-                business_id = None
-                business_name = None
+                    return HTMLResponse(content=f"<h2>Ошибка: {response.status_code}</h2><pre>{response.text}</pre>")
 
-            # Сохраняем данные в базе
+            # Создаём MarketplaceAccount
             new_account = MarketplaceAccount(
                 user_id=user.id,
                 marketplace=marketplace,
@@ -207,6 +224,20 @@ async def auth_submit(request: Request, db: Session = Depends(get_db)):
                 business_name=business_name
             )
             db.add(new_account)
+            db.commit()
+            db.refresh(new_account)  # чтобы получить new_account.id
+
+            # Теперь сохраняем все кампании
+            if marketplace == 'Яндекс.Маркет':
+                for camp in campaigns:
+                    new_camp = Campaign(
+                        marketplace_account_id=new_account.id,
+                        campaign_id=camp['id'],
+                        domain=camp.get('domain'),
+                        name=camp.get('name'),
+                        placement_type=camp.get('placementType')
+                    )
+                    db.add(new_camp)
 
     db.commit()
 
@@ -401,13 +432,16 @@ async def get_review(telegram_id: int, account_id: int, page_token: str = None, 
         raise HTTPException(status_code=400, detail='Marketplace account not found')
 
     if account.marketplace == 'Яндекс.Маркет':
-        review, review_id, next_page_token = get_last_review_yandex(account, page_token)
+        review, review_id, next_page_token, short_data = get_last_review_yandex(account, page_token, db)
     else:
         raise HTTPException(status_code=400, detail='Marketplace not supported yet')
 
     # Генерируем ответ
+    review, review_id, next_page_token, short_data = get_last_review_yandex(account, page_token, db)
     if review_id:
-        reply = generate_reply_to_review(review)
+        # Вызываем новую версию generate_reply_to_review, 
+        # куда передадим short_data
+        reply = generate_reply_to_review(short_data)
     else:
         reply = ""
 
@@ -420,9 +454,14 @@ async def get_review(telegram_id: int, account_id: int, page_token: str = None, 
 
 
 # функция получения отзыва
-def get_last_review_yandex(account: MarketplaceAccount, page_token: str = None):
-    token = account.api_key
+def get_last_review_yandex(account: MarketplaceAccount, page_token: str, db: Session):
+    """
+    Получает последний отзыв с Яндекс.Маркета (goods-feedback) для данного account.
+    Если находим orderId в отзыве, пытаемся определить SKU и название товара,
+    пройдя по всем кампаниям данного аккаунта.
+    """
 
+    token = account.api_key
     headers = {
         'Authorization': f'Bearer {token}',
         'Content-Type': 'application/json'
@@ -430,57 +469,149 @@ def get_last_review_yandex(account: MarketplaceAccount, page_token: str = None):
 
     business_id = account.business_id
     if not business_id:
-        raise HTTPException(status_code=400, detail='Business ID not found for this account')
+        return ("Ошибка: business_id не найден", None, None)
 
+    # URL для получения отзывов
     url = f'https://api.partner.market.yandex.ru/v2/businesses/{business_id}/goods-feedback'
-
+    
     # Параметры запроса
     params = {
-        'limit': 1
+        'limit': 1  # берем 1 отзыв
     }
     if page_token:
         params['page_token'] = page_token
-
+    
     data = {
         'reactionStatus': 'NEED_REACTION',
         'paid': False
     }
 
     response = requests.post(url, headers=headers, params=params, json=data)
-    if response.status_code == 200:
-        data = response.json()
-        feedbacks = data.get('result', {}).get('feedbacks', [])
-        next_page_token = data.get('result', {}).get('paging', {}).get('nextPageToken')
-        
-        if feedbacks:
-            last_feedback = feedbacks[0]
-            review_id = last_feedback.get('feedbackId')
-            author = last_feedback.get('author', 'Неизвестный автор')
-            description = last_feedback.get('description', {})
-            advantages = description.get('advantages', '')
-            disadvantages = description.get('disadvantages', '')
-            comment = description.get('comment', '')
-            date = last_feedback.get('createdAt', '')
-            rating = last_feedback.get('statistics', {}).get('rating', 'Нет оценки')
+    if response.status_code != 200:
+        return (f"Ошибка при получении отзыва: {response.status_code}, {response.text}", None, None)
 
-            review_text = f"Отзыв от {author} ({date}):\n"
-            review_text += f"Оценка: {rating}/5\n\n"
-            if advantages:
-                review_text += f"Плюсы:\n{advantages}\n\n"
-            if disadvantages:
-                review_text += f"Минусы:\n{disadvantages}\n\n"
-            if comment:
-                review_text += f"Комментарий:\n{comment}"
+    data = response.json()
+    feedbacks = data.get('result', {}).get('feedbacks', [])
+    next_page_token = data.get('result', {}).get('paging', {}).get('nextPageToken')
 
-            return review_text, review_id, next_page_token
+    if not feedbacks:
+        return ("Нет доступных отзывов.", None, None)
+
+    # Берём первый (последний) отзыв
+    last_feedback = feedbacks[0]
+    review_id = last_feedback.get('feedbackId')
+    author = last_feedback.get('author', 'Неизвестный автор')
+    description = last_feedback.get('description', {})
+    advantages = description.get('advantages', '')
+    disadvantages = description.get('disadvantages', '')
+    comment = description.get('comment', '')
+    date = last_feedback.get('createdAt', '')
+    rating = last_feedback.get('statistics', {}).get('rating', 'Нет оценки')
+
+    # Базовый текст отзыва
+    review_text = f"Отзыв от {author} ({date}):\n"
+    review_text += f"Оценка: {rating}/5\n\n"
+    if advantages:
+        review_text += f"Плюсы:\n{advantages}\n\n"
+    if disadvantages:
+        review_text += f"Минусы:\n{disadvantages}\n\n"
+    if comment:
+        review_text += f"Комментарий:\n{comment}"
+
+    # Новая логика: ищем SKU и название товара
+    order_id = last_feedback.get('identifiers', {}).get('orderId')
+    if order_id:
+        # Достаём все кампании данного аккаунта
+        campaigns = db.query(Campaign).filter(Campaign.marketplace_account_id == account.id).all()
+
+        offer_id = None
+        offer_name = None
+        placement_type = None
+
+        for camp in campaigns:
+            # пытаемся найти заказ в данной кампании
+            oi, oname = get_item_info_yandex(account.api_key, camp.campaign_id, order_id)
+            if oi and oname:
+                offer_id = oi
+                offer_name = oname
+                placement_type = camp.placement_type  # "FBY", "FBS" и т.д.
+                break
+
+        if offer_id and offer_name:
+            review_text += f"\n\nТовар: {offer_name} (SKU: {offer_id})"
+            # Добавим id заказа
+            review_text += f"\nЗаказ №{order_id}"
+            if placement_type:
+                review_text += f"\nМодель работы: {placement_type}"
+
+    return (
+        review_text,         # Полный текст, для UI
+        review_id, 
+        next_page_token,
+        {
+            "author": author,
+            "advantages": advantages,
+            "disadvantages": disadvantages,
+            "comment": comment,
+            "product_name": offer_name
+        }  # словарь для GPT
+        )
+
+
+def get_item_info_yandex(api_key: str, campaign_id: int, order_id: int):
+    """
+    Пытается сделать GET /campaigns/{campaignId}/orders/{orderId}
+    Если удаётся найти items, возвращаем (offerId, offerName) (первый item, для примера).
+    Если не найден, возвращаем (None, None).
+    """
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+    url = f"https://api.partner.market.yandex.ru/campaigns/{campaign_id}/orders/{order_id}"
+
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        data = resp.json()
+        items = data.get('order', {}).get('items', [])
+        if items:
+            item = items[0]
+            offer_id = item.get('offerId')
+            offer_name = item.get('offerName')
+            return (offer_id, offer_name)
         else:
-            return "Нет доступных отзывов.", None, None
+            return (None, None)
     else:
-        return f"Ошибка при получении отзыва: {response.status_code}, {response.text}", None, None
+        # заказ не найден в этой кампании (или нет доступа)
+        return (None, None)
     
 
 # Cинхронная функция для генерации ответа на отзыв
-def generate_reply_to_review(review_text: str) -> str:
+def generate_reply_to_review(short_data: dict) -> str:
+    """
+    short_data: {
+      'author': ...,
+      'advantages': ...,
+      'disadvantages': ...,
+      'comment': ...,
+      'product_name': ...
+    }
+    """
+    author = short_data.get('author') or "Неизвестно"
+    pluses = short_data.get('advantages') or ""
+    minuses = short_data.get('disadvantages') or ""
+    comment = short_data.get('comment') or ""
+    product_name = short_data.get('product_name') or "неизвестный товар"
+
+    # Сформируем короткий текст отзыва
+    user_prompt = f"Отзыв от {author} о товаре '{product_name}':\n"
+    if pluses:
+        user_prompt += f"Плюсы: {pluses}\n"
+    if minuses:
+        user_prompt += f"Минусы: {minuses}\n"
+    if comment:
+        user_prompt += f"Комментарий: {comment}\n"
+
     messages = [
         {
             "role": "system",
@@ -491,23 +622,23 @@ def generate_reply_to_review(review_text: str) -> str:
         },
         {
             "role": "user",
-            "content": f"Отзыв клиента:\n{review_text}\n\nСгенерируй вежливый и профессиональный ответ на отзыв клиента, не более 200 символов."
+            "content": (
+                f"{user_prompt}\n"
+                "Сгенерируй вежливый и профессиональный ответ на отзыв клиента, не более 250 символов."
+            )
         }
     ]
 
     try:
-        # Синхронный вызов API
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
             max_tokens=300,
             temperature=0.7,
         )
-        # Используем атрибуты объекта для доступа к данным
         reply = response.choices[0].message.content.strip()
         return reply
     except Exception as e:
-        # Логирование ошибки
         print(f"Error in generate_reply_to_review: {e}")
         return "Не удалось сгенерировать ответ на отзыв."
     

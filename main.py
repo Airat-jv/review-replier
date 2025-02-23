@@ -1,9 +1,11 @@
+# ReviewReplier
 # main.py
 import os
 import json
 import uuid
 import requests
 import openai
+import datetime
 from fastapi import FastAPI, Request, Depends, HTTPException, Body
 from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, ForeignKey
@@ -445,13 +447,36 @@ async def get_review(telegram_id: int, account_id: int, page_token: str = None, 
     else:
         reply = ""
 
-    return {
+    # Извлекаем photos из short_data
+    photos = short_data.get("photos", [])
+
+    # Лог перед тем, как вернуть данные
+    response_data = {
         'review': review,
         'reply': reply,
         'review_id': review_id,
-        'next_page_token': next_page_token
+        'next_page_token': next_page_token,
+        'photos': photos
     }
 
+    return response_data
+
+# Функция для форматирования даты
+def format_yandex_date(date_str: str) -> str:
+    """
+    Принимает дату в формате "2025-01-27T11:35:23.1+03:00"
+    и возвращает "27.01.2025 11:35 Мск"
+    """
+    
+    try:
+        # Попробуем встроенный fromisoformat (Python 3.7+)
+        parsed = datetime.datetime.fromisoformat(date_str)
+    except ValueError:
+        # Если не получилось, используем dateutil, который более гибкий
+        from dateutil import parser
+        parsed = parser.isoparse(date_str)
+    
+    return parsed.strftime("%d.%m.%Y %H:%M") + " Мск"
 
 # функция получения отзыва
 def get_last_review_yandex(account: MarketplaceAccount, page_token: str, db: Session):
@@ -505,11 +530,14 @@ def get_last_review_yandex(account: MarketplaceAccount, page_token: str, db: Ses
     advantages = description.get('advantages', '')
     disadvantages = description.get('disadvantages', '')
     comment = description.get('comment', '')
-    date = last_feedback.get('createdAt', '')
+    raw_date = last_feedback.get('createdAt', '')
+    formatted_date = format_yandex_date(raw_date)
     rating = last_feedback.get('statistics', {}).get('rating', 'Нет оценки')
+    media = last_feedback.get('media', {})
+    photos = media.get('photos', [])
 
     # Базовый текст отзыва
-    review_text = f"Отзыв от {author} ({date}):\n"
+    review_text = f"Отзыв от {author} ({formatted_date}):\n"
     review_text += f"Оценка: {rating}/5\n\n"
     if advantages:
         review_text += f"Плюсы:\n{advantages}\n\n"
@@ -544,18 +572,17 @@ def get_last_review_yandex(account: MarketplaceAccount, page_token: str, db: Ses
             if placement_type:
                 review_text += f"\nМодель работы: {placement_type}"
 
-    return (
-        review_text,         # Полный текст, для UI
-        review_id, 
-        next_page_token,
-        {
-            "author": author,
-            "advantages": advantages,
-            "disadvantages": disadvantages,
-            "comment": comment,
-            "product_name": offer_name
-        }  # словарь для GPT
-        )
+    short_data = {
+        "author": author,
+        "advantages": advantages,
+        "disadvantages": disadvantages,
+        "comment": comment,
+        "product_name": offer_name,
+        "photos": photos,
+        "seller_name": account.account_name
+        }
+
+    return (review_text, review_id, next_page_token, short_data)
 
 
 def get_item_info_yandex(api_key: str, campaign_id: int, order_id: int):
@@ -588,23 +615,15 @@ def get_item_info_yandex(api_key: str, campaign_id: int, order_id: int):
 
 # Cинхронная функция для генерации ответа на отзыв
 def generate_reply_to_review(short_data: dict) -> str:
-    """
-    short_data: {
-      'author': ...,
-      'advantages': ...,
-      'disadvantages': ...,
-      'comment': ...,
-      'product_name': ...
-    }
-    """
     author = short_data.get('author') or "Неизвестно"
     pluses = short_data.get('advantages') or ""
     minuses = short_data.get('disadvantages') or ""
     comment = short_data.get('comment') or ""
     product_name = short_data.get('product_name') or "неизвестный товар"
+    seller_name = short_data.get('seller_name') or "неизвестном продавце"
 
     # Сформируем короткий текст отзыва
-    user_prompt = f"Отзыв от {author} о товаре '{product_name}':\n"
+    user_prompt = f"Отзыв от {author} о товаре '{product_name}' у продавца '{seller_name}':\n"
     if pluses:
         user_prompt += f"Плюсы: {pluses}\n"
     if minuses:
@@ -616,25 +635,26 @@ def generate_reply_to_review(short_data: dict) -> str:
         {
             "role": "system",
             "content": (
-                "Ты профессиональный менеджер по работе с клиентами, который отвечает на отзывы клиентов на маркетплейсе. "
-                "Всегда отвечай вежливо и профессионально."
+                "Ты эксперт по управлению репутацией брендов. Ты пишешь ответы на отзывы клиентов продавца на маркетплейсах. "
+                "Ответы должны акцентировать внимание на положительных качествах товара, развивая их и минимизируя негатив, "
+                "предлагая альтернативы. Все для укрепления доверия потенциальных покупателей."
             )
         },
         {
             "role": "user",
             "content": (
                 f"{user_prompt}\n"
-                "Сгенерируй вежливый и профессиональный ответ на отзыв клиента, не более 250 символов."
+                "Сгенерируй вежливый и профессиональный ответ на отзыв клиента, не более 280 символов."
             )
         }
     ]
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=messages,
-            max_tokens=300,
-            temperature=0.7,
+            max_tokens=280,
+            temperature=0.8,
         )
         reply = response.choices[0].message.content.strip()
         return reply

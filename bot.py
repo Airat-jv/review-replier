@@ -1,10 +1,12 @@
+# ReviewReplier
 # bot.py
 
 import os
 import aiohttp
 import json
+import re
 from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import BotCommand, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import BotCommand, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto, MediaGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # Получаем переменные окружения
@@ -19,6 +21,13 @@ if not TELEGRAM_TOKEN:
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+
+def escape_markdown_v2(text: str) -> str:
+    """
+    Экранирует спецсимволы Telegram Markdown V2.
+    """
+    pattern = r'([*_`$begin:math:display$$end:math:display$()~>#+\-=|{}.!])'
+    return re.sub(pattern, r'\\\1', text)
 
 # Установка команд бота
 async def set_default_commands(dp):
@@ -210,7 +219,8 @@ async def cmd_start(message: types.Message):
         auth_token = user_info.get('auth_token', '')
         if not auth_token:
             auth_token = await generate_token(message.from_user.id)
-        greeting = f"Здравствуйте, {name}! Добро пожаловать в *ReviewReplierBot*!\n\n"
+        safe_name = escape_markdown_v2(name)
+        greeting = f"Здравствуйте, {safe_name}! Добро пожаловать в *ReviewReplierBot*!\n\n"
         welcome_text = (
             f"{greeting}"
             "Этот бот поможет вам управлять отзывами на маркетплейсах. Вы можете получать свежие отзывы и быстро отвечать на них с помощью интеграции с ChatGPT.\n\n"
@@ -367,6 +377,7 @@ async def handle_review_actions(message: types.Message):
                 reply = data.get('reply')
                 review_id = data.get('review_id')
                 new_next_page_token = data.get('next_page_token')
+                photos = data.get('photos', [])
 
                 if review_id:
                     # Сохраняем данные
@@ -377,8 +388,23 @@ async def handle_review_actions(message: types.Message):
                     user_data['current_mode'] = None
                     await storage.update_data(chat=chat_id, user=user_id, data=user_data)
 
-                    await message.answer(f"**Отзыв:**\n\n{review}", parse_mode=ParseMode.MARKDOWN)
-                    await message.answer(f"**Предлагаемый ответ:**\n\n{reply}", parse_mode=ParseMode.MARKDOWN)
+                    # Отправляем основной текст
+                    safe_review = escape_markdown_v2(review)
+                    await message.answer(f"**Отзыв:**\n\n{safe_review}", parse_mode=ParseMode.MARKDOWN_V2)
+
+                    # Отправляем фото (если есть)
+                    if photos:
+                        if len(photos) == 1:
+                            await message.answer_photo(photo=photos[0])
+                        else:
+                            media_group = MediaGroup()
+                            for p_url in photos:
+                                media_group.attach_photo(InputMediaPhoto(p_url))
+                            await message.answer_media_group(media_group)
+                    
+                    # Отправляем предложенный ответ
+                    safe_reply = escape_markdown_v2(reply)
+                    await message.answer(f"**Предлагаемый ответ:**\n\n{safe_reply}", parse_mode=ParseMode.MARKDOWN_V2)
 
                     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
                     keyboard.add("Отправить предложенный ответ", "Написать свой ответ")
